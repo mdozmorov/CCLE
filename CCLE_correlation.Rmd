@@ -1,0 +1,288 @@
+---
+title: "CCLE exploratory Data Analysis"
+author: "Mikhail Dozmorov"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: no
+  html_document:
+    theme: cerulean
+    toc: yes
+---
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+# Set up the environment
+library(knitr)
+opts_chunk$set(cache.path='cache/', fig.path='img/', cache=F, tidy=T, fig.keep='high', echo=F, dpi=100, warnings=F, message=F, comment=NA, warning=F, results='as.is', fig.width = 10, fig.height = 6) #out.width=700, 
+library(pander)
+panderOptions('table.split.table', Inf)
+set.seed(1)
+library(dplyr)
+options(stringsAsFactors = FALSE)
+```
+
+```{r eval=FALSE}
+library(MultiAssayExperiment)
+# Download the data file from http://s3.amazonaws.com/multiassayexperiments/example/ccleMAEO.rds
+fileName <- "/Users/mdozmorov/Documents/Data/GenomeRunner/MultiAssayExperiment-CCLE/ccleMAEO.rds"
+mae <- readRDS(file = fileName)
+mae <- updateObject(mae)
+mae
+```
+
+```{r}
+library(readr)
+library(annotables)
+library(MDmisc)
+library(enrichR)
+# Remove non-canonical chromosome names
+grch38 <- grch38[ !(grepl("_", grch38$chr) | grepl("GL", grch38$chr)), ]
+grch38 <- grch38[, c("symbol", "description")]
+grch38 <- grch38[ complete.cases(grch38) , ]
+grch38 <- grch38[ !duplicated(grch38), ]
+```
+
+```{r settings}
+system("mkdir -p data")
+system("mkdir -p results")
+
+# Selected genes
+precalculated  <- FALSE
+selected_genes <- c("REST") # If nothing precalculated - use one of the genes
+method         <- "" # If correlation with the selected_gene is measured, method is empty
+# If precalculated, use precalculated values
+# precalculated  <- TRUE 
+# selected_genes <- "interferon_signature" 
+# method         <- "NMF" # Which dimensionaliry reduction results to use, from NMF, PCA, FA
+
+# Data type
+# Expression cutoffs. To use all expression, use "0" expression cutoff and "TRUE" top_expression
+expression_cutoff <- 0   # From 0 to 1, percent cutoff of expression of the selected gene
+top_expression    <- TRUE # Whether to take top (TRUE) of bottom (FALSE) expression 
+# Subset by a certain cell type
+subset_by_cell <- "LUNG" # Use NA for including all cells
+
+dir <- "/Users/mdozmorov/Documents/Data/GenomeRunner/MultiAssayExperiment-CCLE/"
+fileNameIn <- "CCLE_TPM.rda" # The TPM matrix from ftp://caftpd.nci.nih.gov/pub/OCG-DCC/CTD2/TGen/CCLE_RNA-seq_Analysis/ccle_gene_quantification.zip
+fileNameIn <- "CCLE_RPKM.rda" # The RPKM matrix from https://portals.broadinstitute.org/ccle/data
+fileNameOut <- paste0("results/Correlation_", selected_genes, "_", ifelse(is.na(subset_by_cell), "ALL", subset_by_cell), ".rda") # Save correlation data
+fileNameRes <- paste0("results/Results_", selected_genes, "_", ifelse(is.na(subset_by_cell), "ALL", subset_by_cell), ".xlsx") # Save results
+
+# Correlation type
+corr_type    <- "pearson"
+# Correlation cutoffs
+corr_cutoff  <- 0.2
+pval_cutoff  <- 0.05
+# Enrichment cutoffs
+p.adj.cutoff <- 0.1
+fdr.cutoff   <- 0.3
+top_X        <- 10 # How many top significant differentially expressed genes/pathways to output
+```
+
+```{r loadExpressionDataTPM, eval=FALSE}
+# Download and unzip ftp://caftpd.nci.nih.gov/pub/OCG-DCC/CTD2/TGen/CCLE_RNA-seq_Analysis/ccle_gene_quantification.zip
+# Download ftp://caftpd.nci.nih.gov/pub/OCG-DCC/CTD2/TGen/CCLE_RNA-seq_Analysis/CCLE_id_mapping.txt
+sample_annot <- read_delim(paste0(dir, "CCLE_id_mapping.txt"), delim = " ")
+
+if( file.exists(paste0(dir, fileNameIn))) {
+  load(paste0(dir, fileNameIn))
+} else {
+  files <- list.files(path = paste0(dir, "ccle_gene_quantification"), pattern = "*.txt", full.names = TRUE)
+
+  exprs_TPM   <- cbind() # Data frame to append TPMs
+  sample_name <- c()     # A vector to append sample names
+  
+  for(file in files) {
+    sample_name <- c(sample_name, basename(file) %>% sub(".gene.quantification.txt", "", ., fixed = TRUE)) # Append sample names
+    tmp <- read_tsv(file, skip = 12)       # Read the file
+    exprs_TPM <- cbind(exprs_TPM, tmp$TPM) # Append TPM
+  }
+  
+  colnames(exprs_TPM) <- sample_name  # Add column names
+  rownames(exprs_TPM) <- tmp$`# Name` # From the last file, use gene names
+  exprs_TPM[1:5, 1:5]
+  exprs_TPM <- WGCNA::collapseRows(exprs_TPM, rowGroup = rownames(exprs_TPM), rowID = rownames(exprs_TPM))$datETcollapsed
+  # Get gene names
+  library(biomaRt)
+  mart <- useMart("ensembl", dataset="hsapiens_gene_ensembl")
+  genes <- getBM(attributes = c('ensembl_gene_id','hgnc_symbol'), filters = 'ensembl_gene_id', values = rownames(exprs_TPM), mart = mart, uniqueRows = T)
+  exprs_TPM <- left_join(data.frame(ensembl_gene_id = rownames(exprs_TPM), exprs_TPM), genes, by = c("ensembl_gene_id"))
+  exprs_TPM <- exprs_TPM[!(is.na(exprs_TPM$hgnc_symbol) | exprs_TPM$hgnc_symbol == ""), ]
+  all_expression <- WGCNA::collapseRows(exprs_TPM[, 2:(ncol(exprs_TPM) - 1)], rowGroup = exprs_TPM$hgnc_symbol, rowID = rownames(exprs_TPM))$datETcollapsed
+  all_expression[1:5, 1:5]
+  all_expression <- log2(expr + 1)
+  setdiff(colnames(all_expression), sample_annot$analysis_id %>% make.names())
+  setdiff(sample_annot$analysis_id %>% make.names(), colnames(all_expression))
+  
+  save("all_expression", file = paste0(dir, fileNameIn))
+}
+```
+
+```{r loadExpressionDataRPKM}
+# https://github.com/cran/CePa/blob/master/R/read.gct.R
+read.gct <-
+function (file) {
+    expr = read.table(file, skip = 2, header = TRUE, sep = "\t", quote = "")
+    rownames(expr) = expr[,1]
+
+    checkName = table(expr[,1])
+    if(max(checkName) > 1) {
+        stop(paste("Genes in gct file should be unique: ", names(which.max(checkName)), sep = " "))
+    }
+    expr = expr[,-c(1,2)]
+    expr = as.matrix(expr)
+    
+    return(expr)
+}
+if( file.exists(paste0(dir, fileNameIn))) {
+  load(paste0(dir, fileNameIn))
+} else {
+  # Download CCLE_DepMap_18Q1_RNAseq_RPKM_20180214.gct from https://portals.broadinstitute.org/ccle/data
+  exprs_RPKM <- read.gct("/Users/mdozmorov/Downloads/CCLE_DepMap_18Q1_RNAseq_RPKM_20180214.gct")
+  rownames(exprs_RPKM) <- sapply(rownames(exprs_RPKM), function(x) strsplit(x, split = ".", fixed = TRUE)[[1]][1]) %>% as.character()
+  exprs_RPKM <- WGCNA::collapseRows(exprs_RPKM, rowGroup = rownames(exprs_RPKM), rowID = rownames(exprs_RPKM))$datETcollapsed
+  # Get gene names
+  library(biomaRt)
+  mart <- useMart("ensembl", dataset="hsapiens_gene_ensembl")
+  genes <- getBM(attributes = c('ensembl_gene_id','hgnc_symbol'), filters = 'ensembl_gene_id', values = rownames(exprs_RPKM), mart = mart, uniqueRows = T)
+  exprs_RPKM <- left_join(data.frame(ensembl_gene_id = rownames(exprs_RPKM), exprs_RPKM), genes, by = c("ensembl_gene_id"))
+  exprs_RPKM <- exprs_RPKM[!(is.na(exprs_RPKM$hgnc_symbol) | exprs_RPKM$hgnc_symbol == ""), ]
+  all_expression <- WGCNA::collapseRows(exprs_RPKM[, 2:(ncol(exprs_RPKM) - 1)], rowGroup = exprs_RPKM$hgnc_symbol, rowID = rownames(exprs_RPKM))$datETcollapsed
+  all_expression[1:5, 1:5]
+  all_expression <- log2(all_expression + 1)
+
+  save("all_expression", file = paste0(dir, fileNameIn))
+}
+```
+
+
+```{r correlations}
+if (!file.exists(fileNameOut)) {
+  # Subset by cell type, if any
+  if(!is.na(subset_by_cell)){
+    all_expression <- all_expression[, grepl(subset_by_cell, colnames(all_expression))]
+  }
+  
+  all_corrs <- vector(mode = "numeric", length = nrow(all_expression))
+  all_pvals <- vector(mode = "numeric", length = nrow(all_expression))
+  if (precalculated) {
+    load(paste0("data/", cancer_RNASeq2, "_", selected_genes, "_", method, ".Rda"))
+  }
+  for (i in 1:nrow(all_expression)) {
+    # Depending on the existence of precalculated value, calculate the correlation
+    cors <- Hmisc::rcorr(if(precalculated) {mtx_reduced[, 1]} else {all_expression[ rownames(all_expression) == selected_genes, ]},
+                         all_expression[ i, ], type = corr_type)
+    all_corrs[i] <- cors[[1]][1, 2]
+    all_pvals[i] <- cors[[3]][1, 2]
+  }
+  
+  # all_corrs <- apply(all_expression, 1, function(x) Hmisc::rcorr(all_expression[ rownames(all_expression) == selected_genes], x)[[1]][1, 2])
+  # all_pvals <- apply(all_expression, 1, function(x) Hmisc::rcorr(all_expression[ rownames(all_expression) == selected_genes], x)[[3]][1, 2])
+  correlations <- data_frame(hgnc = rownames(all_expression), corr = all_corrs, pval = all_pvals)
+  correlations <- right_join(grch38, correlations, by = c("symbol" = "hgnc"))
+  correlations <- correlations[ !(is.na(correlations$description) | correlations$description == ""), ]
+  save(correlations, file = fileNameOut)
+} else {
+  load(file = fileNameOut)
+}
+# Save correlation results
+# Create (or, load)  Excel file
+unlink(fileNameRes)
+wb <- openxlsx::createWorkbook(fileNameRes) # loadWorkbook(fileNameRes) # 
+save_res(correlations[ order(correlations$corr, decreasing = TRUE), ], fileName = fileNameRes, wb = wb, sheetName = "CORR")
+```
+
+
+# Correlation analysis
+
+```{r}
+# sum(correlations$pval < pval_cutoff & correlations$corr > corr_cutoff)
+correlations.subset <- correlations[ correlations$pval < pval_cutoff & abs(correlations$corr) > corr_cutoff, ]
+correlations.subset$corr <- signif(correlations.subset$corr)
+correlations.subset$pval <- signif(correlations.subset$pval)
+# DT::datatable(correlations.subset[ order(correlations.subset$corr, decreasing = TRUE), ])
+up.genes <- sort(unique(correlations[ correlations$pval < pval_cutoff & correlations$corr >  corr_cutoff, ]$symbol))
+dn.genes <- sort(unique(correlations[ correlations$pval < pval_cutoff & correlations$corr < -corr_cutoff, ]$symbol))
+```
+
+Genes positively (n = `r length(up.genes)`) and negatively (n = `r length(dn.genes)`) correlating with the selected gene `r selected_genes` at p < `r pval_cutoff` cutoff and  `r corr_type` correlation coefficient cutoff: >`r corr_cutoff`. Legend:
+
+- `symbol`, `description` - gene symbols/description
+- `cor`, `pval - Pearson correlation coefficient, and p-value of correlation significance
+
+Full correlation results are saved in `r fileNameRes` file.
+
+# Functional enrichment analysis
+
+## KEGG canonical pathway enrichment analysis 
+
+- Genes positively and negatively correlated with the `r selected_genes` are tested for pathway enrichment separately. 
+
+- Each table has enrichment results for both positively/negatively correlated genes. The "direction" column indicate which pathways are enriched in "UP"- or "DN"-regulated genes for positively/negatively correlated genes, respectively.
+
+- Use the "Search" box for each table, to filter the results for "UP" or "DN" only. Search is global within the table, case insensitive.
+
+- FDR cutoff of the significant enrichments - `r fdr.cutoff`.
+
+**Legend:** "database" - source of functional annotations, "category" - name of functional annotation,  "pval" - unadjusted enrichment p-value,  "qval" - FDR-adjusted p-value,  "genes" - comma-separated differentially expressed genes enriched in a corresponding functional category,  "direction" - UP/DN, an indicator whether genes are up- or downregulated.
+
+```{r}
+res.kegg <- save_enrichr(up.genes = c(up.genes, dn.genes), databases = "KEGG_2016", fdr.cutoff = fdr.cutoff, fileName = fileNameRes, wb = wb)
+# Display the results
+# DT::datatable(res.kegg)
+if (nrow(res.kegg) > 0 ) {
+  kable(res.kegg[1:min(top_X, nrow(res.kegg)), ])
+}
+```
+
+```{r eval = FALSE}
+# For the genes best correlating with the selected gene `r selected_genes` across all cancers. Legend:
+# 
+# - `ID` - unique identifier of functional category
+# - `Pvalue` - non-adjusted p-value
+# - `OddsRatio` - enrichment odds ratio
+# - `ExpCount` - number of genes expected to be selected in a category
+# - `Count` - number of genes observed in the current list
+# - `Size` - total number of genes in a category
+# - `Term` - category description
+# - `p.adj` - false discovery rate
+# - `SYMBOL`, `ENTREZ` - genes observed in the current list as annotated with a category
+
+res <- gene_enrichment(selected = correlations$symbol, id="symbol", use="KEGG")
+res$Pvalue <- signif(res$Pvalue)
+res$OddsRatio <- signif(res$OddsRatio)
+res$ExpCount <- signif(res$ExpCount)
+DT::datatable(res)
+```
+
+```{r eval = FALSE}
+eg = bitr(correlations$symbol, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+correlations <- left_join(correlations, eg, by = c("symbol" = "SYMBOL"))
+
+geneList <- correlations$corr
+names(geneList) <- correlations$ENTREZID
+geneList <- geneList[ order(geneList, decreasing = TRUE) ]
+
+kk2 <- gseKEGG(geneList     = geneList,
+               organism     = 'hsa',
+               nPerm        = 1000,
+               minGSSize    = 10,
+               pvalueCutoff = 1,
+               verbose      = TRUE)
+head(summary(kk2))
+```
+
+```{r eval = F}
+degs       <- read.xlsx(fileNameRes, cols = c(1, 3), sheet = "CORR") # Read in two columns, gene symbol and fold change
+degs.genes <- degs$corr                           # A vector of numeric log fold changes 
+names(degs.genes) <- degs$symbol                   # Give this vector names
+
+# Adjust as needed
+pv.out <- pathview(gene.data = degs.genes, pathway.id = "hsa05217", species = "hsa", gene.idtype = "SYMBOL", gene.annotpkg = "org.Hs.eg.db", out.suffix = paste(selected_genes, collapse = "-"))
+```
+
+```{r echo=FALSE, out.height='300px', eval=FALSE}
+knitr::include_graphics('hsa05217.MIA.png')
+```
+
+
