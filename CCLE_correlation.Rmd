@@ -48,7 +48,8 @@ system("mkdir -p results")
 
 # Selected genes
 precalculated  <- FALSE
-selected_genes <- c("REST") # If nothing precalculated - use one of the genes
+# ASCL1, REST, SYP, CHGB, DLL3
+selected_genes <- c("CHGB") # If nothing precalculated - use one of the genes
 method         <- "" # If correlation with the selected_gene is measured, method is empty
 # If precalculated, use precalculated values
 # precalculated  <- TRUE 
@@ -77,6 +78,7 @@ pval_cutoff  <- 0.05
 p.adj.cutoff <- 0.1
 fdr.cutoff   <- 0.3
 top_X        <- 10 # How many top significant differentially expressed genes/pathways to output
+max_num_genes <- 6000 # Maximum number of genes to feed into KEGG enrichment
 ```
 
 ```{r loadExpressionDataTPM, eval=FALSE}
@@ -179,6 +181,8 @@ if (!file.exists(fileNameOut)) {
   # all_corrs <- apply(all_expression, 1, function(x) Hmisc::rcorr(all_expression[ rownames(all_expression) == selected_genes], x)[[1]][1, 2])
   # all_pvals <- apply(all_expression, 1, function(x) Hmisc::rcorr(all_expression[ rownames(all_expression) == selected_genes], x)[[3]][1, 2])
   correlations <- data_frame(hgnc = rownames(all_expression), corr = all_corrs, pval = all_pvals)
+  correlations <- correlations[complete.cases(correlations), ] # Remove NAs
+  correlations$pval <- formatC(correlations$pval, format = "e", digits = 5) # Format p-values
   correlations <- right_join(grch38, correlations, by = c("symbol" = "hgnc"))
   correlations <- correlations[ !(is.na(correlations$description) | correlations$description == ""), ]
   save(correlations, file = fileNameOut)
@@ -197,12 +201,17 @@ save_res(correlations[ order(correlations$corr, decreasing = TRUE), ], fileName 
 
 ```{r}
 # sum(correlations$pval < pval_cutoff & correlations$corr > corr_cutoff)
-correlations.subset <- correlations[ correlations$pval < pval_cutoff & abs(correlations$corr) > corr_cutoff, ]
+correlations.subset <- correlations[ as.numeric(correlations$pval) < pval_cutoff & abs(correlations$corr) > corr_cutoff, ]
 correlations.subset$corr <- signif(correlations.subset$corr)
-correlations.subset$pval <- signif(correlations.subset$pval)
+correlations.subset$pval <- signif(as.numeric(correlations.subset$pval))
+# If too many, subset to the maximum number of genes
+if (nrow(correlations.subset) > max_num_genes) {
+  correlations.subset <- correlations.subset[ order(abs(correlations.subset$corr), decreasing = TRUE), ]
+  correlations.subset <- correlations.subset[1:max_num_genes, ]
+} 
 # DT::datatable(correlations.subset[ order(correlations.subset$corr, decreasing = TRUE), ])
-up.genes <- sort(unique(correlations[ correlations$pval < pval_cutoff & correlations$corr >  corr_cutoff, ]$symbol))
-dn.genes <- sort(unique(correlations[ correlations$pval < pval_cutoff & correlations$corr < -corr_cutoff, ]$symbol))
+up.genes <- correlations.subset$symbol[correlations.subset$corr > corr_cutoff] %>% unique
+dn.genes <- correlations.subset$symbol[correlations.subset$corr < -corr_cutoff] %>% unique
 ```
 
 Genes positively (n = `r length(up.genes)`) and negatively (n = `r length(dn.genes)`) correlating with the selected gene `r selected_genes` at p < `r pval_cutoff` cutoff and  `r corr_type` correlation coefficient cutoff: >`r corr_cutoff`. Legend:
