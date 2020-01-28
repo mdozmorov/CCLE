@@ -10,3 +10,6 @@ From https://ocg.cancer.gov/programs/ctd2/data-portal, ftp://caftpd.nci.nih.gov/
 
 From https://docs.google.com/spreadsheets/d/1Ih64DDS5mqDlYFzDyCY9HAUnxvI1b6hapKP_akFuNPY/edit#gid=27255898, http://s3.amazonaws.com/multiassayexperiments/example/ccleMAEO.rds
 
+# Related resources
+
+- R scripts and tutorial for working with CCLE data, RPKM expression and cell annotations, by Kevin Blighe. https://github.com/kevinblighe/AunerLab_CCLE
